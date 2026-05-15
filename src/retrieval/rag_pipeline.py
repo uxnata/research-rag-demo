@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from qdrant_client import QdrantClient
@@ -48,8 +49,8 @@ RETRIEVAL_TOP_K = 20
 # Re-ranker модель. Cross-encoder: берёт пару (вопрос, чанк)
 # и выдаёт score релевантности. Точнее, чем cosine similarity,
 # но медленнее — поэтому используем двухэтапную схему.
-# cross-encoder/ms-marco-MiniLM-L-6-v2 — ~80 MB, лёгкая альтернатива при ограниченном диске.
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# BAAI/bge-reranker-v2-m3 — мультиязычный, ~560 MB.
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Порог релевантности. Если лучший результат ниже этого score —
 # значит в базе нет ничего по теме, и нет смысла тратить токены
@@ -64,15 +65,18 @@ RETRY_DELAY = 3  # секунды между попытками
 # Системный промпт — инструкция для GigaChat.
 # Это САМАЯ важная часть RAG после retrieval.
 # Плохой промпт = модель игнорирует контексты и галлюцинирует.
-SYSTEM_PROMPT = """Ты — аналитик-исследователь Банка России. Твоя задача — отвечать на вопросы СТРОГО на основе предоставленных фрагментов отчётов ЦБ РФ.
+SYSTEM_PROMPT = """Ты — аналитик-исследователь Банка России. Твоя задача — отвечать на вопросы СТРОГО на основе предоставленных фрагментов отчетов ЦБ РФ.
 
 Правила:
 1. Отвечай ТОЛЬКО на основе предоставленных фрагментов. Не используй свои знания.
 2. Для каждого факта указывай источник в формате [Источник: файл, стр. N].
-3. Если в фрагментах нет информации для ответа — честно скажи об этом.
+3. Если в фрагментах нет информации для ответа — честно скажи «В предоставленных фрагментах данных по этой теме нет».
 4. Используй точные цифры из фрагментов, не округляй.
-5. Отвечай на русском языке, профессионально, но понятно.
-6. Если данные из разных месяцев противоречат друг другу — это нормально, укажи динамику."""
+5. НЕ вычисляй итоги, НЕ суммируй числа из разных фрагментов, НЕ считай средние. Приводи только те цифры, которые явно написаны в тексте.
+6. НЕ делай выводов, которых нет в тексте. Если написано «прибыль выросла на 14%» — можно сказать «прибыль выросла на 14%». Нельзя добавлять «что свидетельствует о восстановлении сектора».
+7. САМОПРОВЕРКА: перед тем как написать любую цифру, убедись, что она ДОСЛОВНО присутствует в одном из фрагментов. Если цифра получена вычислением или из твоих знаний — НЕ включай ее в ответ.
+8. Отвечай на русском языке, профессионально, но понятно.
+9. Если данные из разных месяцев — укажи каждый месяц отдельно с источником."""
 
 
 def build_context(results) -> str:
@@ -93,6 +97,68 @@ def build_context(results) -> str:
         context_parts.append(header + payload["text"])
 
     return "\n\n".join(context_parts)
+
+
+def verify_answer(answer: str, context: str) -> str:
+    """
+    Corrective RAG: post-generation verification через YandexGPT.
+
+    Паттерн из 2026 года — после генерации ответа отдельная модель
+    проверяет каждое утверждение против контекста.
+    Неподтвержденные утверждения удаляются.
+
+    Зачем отдельная модель (YandexGPT), а не та же (GigaChat)?
+    Чтобы избежать self-confirmation bias — модель склонна
+    подтверждать свои же ответы.
+    """
+    api_key = os.getenv("YANDEX_API_KEY")
+    folder_id = os.getenv("YANDEX_FOLDER_ID")
+
+    # Если YandexGPT не настроен — пропускаем верификацию
+    if not api_key or not folder_id:
+        return answer
+
+    prompt = f"""Ты — строгий верификатор фактов. Проверь ответ аналитика на соответствие контексту.
+
+КОНТЕКСТ (фрагменты отчетов ЦБ РФ):
+{context[:5000]}
+
+ОТВЕТ АНАЛИТИКА:
+{answer}
+
+ЗАДАЧА:
+1. Проверь каждое фактическое утверждение (цифры, даты, проценты, суммы) в ответе.
+2. Если утверждение ДОСЛОВНО подтверждается контекстом — оставь его.
+3. Если утверждение НЕ подтверждается контекстом (цифра отсутствует, вычислена, или взята не оттуда) — УДАЛИ его.
+4. Сохрани структуру и источники оставшихся утверждений.
+5. Если после удаления ничего не осталось — напиши «В предоставленных фрагментах точных данных по этому запросу не найдено».
+
+Верни ТОЛЬКО проверенный ответ, без комментариев о процессе проверки."""
+
+    try:
+        response = requests.post(
+            "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+            headers={
+                "Authorization": f"Api-Key {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "modelUri": f"gpt://{folder_id}/yandexgpt/latest",
+                "completionOptions": {"temperature": 0.1, "maxTokens": 1500},
+                "messages": [{"role": "user", "text": prompt}],
+            },
+            timeout=30,
+        )
+
+        if response.ok:
+            verified = response.json()["result"]["alternatives"][0]["message"]["text"]
+            return verified
+        else:
+            # YandexGPT недоступен — возвращаем оригинал
+            return answer
+
+    except Exception:
+        return answer
 
 
 def rerank(question: str, results, reranker) -> list:
@@ -278,8 +344,13 @@ def rag_query(question: str, model, client, giga, reranker=None) -> dict:
             response = giga.chat(payload)
             answer = response.choices[0].message.content
 
+            # === Corrective RAG: post-generation verification ===
+            # YandexGPT проверяет каждое утверждение GigaChat
+            # против контекста. Неподтвержденные — удаляются.
+            verified_answer = verify_answer(answer, context)
+
             return {
-                "answer": answer,
+                "answer": verified_answer,
                 "sources": sources,
                 "tokens_used": response.usage.total_tokens,
                 "fallback": None,

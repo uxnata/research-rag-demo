@@ -89,12 +89,22 @@ def is_useful_line(line: str) -> bool:
     return russian_count >= MIN_RUSSIAN_CHARS
 
 
-def is_notes_page(raw_text: str) -> bool:
+def is_junk_page(raw_text: str) -> bool:
     """
-    Определяет, является ли страница «Примечаниями».
-    Такие страницы — чистые сноски, бесполезные для RAG.
+    Определяет, является ли страница мусорной:
+    - Примечания (сноски к формам отчетности)
+    - Глоссарий (список аббревиатур: ББЛ, БУЛ, ДКП...)
+    - Оглавление
     """
-    return "Примечания (" in raw_text[:200]
+    first_500 = raw_text[:500]
+    markers = [
+        "Примечания (",
+        "В подобного рода формах",
+        "Банк с базовой лицензией",
+        "Банк с универсальной лицензией",
+        "Денежно-кредитная политика",
+    ]
+    return any(m in first_500 for m in markers)
 
 
 def clean_page_text(raw_text: str) -> str:
@@ -154,8 +164,8 @@ def chunk_pdf(pdf_path: Path) -> list[dict]:
 
         raw_text = page.extract_text() or ""
 
-        # Пропускаем страницы «Примечания» — чистые сноски
-        if is_notes_page(raw_text):
+        # Пропускаем мусорные страницы (примечания, глоссарий)
+        if is_junk_page(raw_text):
             continue
 
         clean_text = clean_page_text(raw_text)
