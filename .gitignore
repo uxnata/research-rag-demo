@@ -1,0 +1,25 @@
+# Секреты — НИКОГДА не коммитить
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Данные (сырые файлы могут быть большими)
+data/raw/
+data/processed/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+data/qdrant_db/
+*.pyc
